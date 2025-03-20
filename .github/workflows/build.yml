@@ -1,43 +1,12 @@
-name: Check & Build PHP-Apache Images
+name: Daily Build PHP-Apache Images
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Tägliche Prüfung auf Updates
+    - cron: '0 0 * * *'  # Täglicher Build
   workflow_dispatch:  # Manuelles Triggern
 
 jobs:
-  check_update:
-    runs-on: ubuntu-latest
-    outputs:
-      update_needed: ${{ steps.check.outputs.update_needed }}
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Install jq
-        run: sudo apt-get install -y jq
-
-      - name: Check for PHP Updates
-        id: check
-        run: |
-          LATEST_VERSION=$(curl -s https://hub.docker.com/v2/repositories/library/php/tags/ | jq -r '.results[].name' | grep '8.4-fpm' | head -n 1)
-          
-          if [ "$LATEST_VERSION" != "$(cat .latest_version 2>/dev/null || echo '')" ]; then
-              echo "New PHP version detected: $LATEST_VERSION"
-              echo "$LATEST_VERSION" > .latest_version
-              git config --global user.email "github-actions@github.com"
-              git config --global user.name "GitHub Actions"
-              git add .latest_version
-              git commit -m "Update latest PHP version to $LATEST_VERSION"
-              git push
-              echo "update_needed=true" >> "$GITHUB_ENV"
-          else
-              echo "update_needed=false" >> "$GITHUB_ENV"
-          fi
-
   build:
-    needs: check_update
-    if: needs.check_update.outputs.update_needed == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:

@@ -2,6 +2,8 @@
 ARG PHP_VERSION=8.4
 FROM php:${PHP_VERSION}-fpm AS base
 
+LABEL org.opencontainers.image.source = "https://github.com/mindbox/docker-apache-php-fpm"
+
 RUN <<EOF
     DEBIAN_FRONTEND=noninteractive
     apt-get update

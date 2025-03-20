@@ -62,6 +62,6 @@ jobs:
           context: ./docker
           file: ./docker/Dockerfile
           push: true
-          tags: derkoenig/php-apache:${{ matrix.php_version }}
+          tags: derkoenig/php-fpm-apache:${{ matrix.php_version }}
           build-args: |
             PHP_VERSION=${{ matrix.php_version }}

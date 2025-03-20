@@ -57,15 +57,15 @@ EOT
 COPY docker/php.ini /usr/local/etc/php/conf.d/zzz-custom.ini
 COPY docker/www.conf /usr/local/etc/php-fpm.d/zzz-custom.conf
 COPY docker/apache2.conf /etc/apache2/apache2.conf
-COPY docker/start.sh /bin/start.sh
+COPY docker/entrypoint.sh /bin/entrypoint.sh
 
 # Get composer installer
 ADD https://getcomposer.org/installer /tmp/composer-installer
 # Set up composer
 RUN <<EOF
-    chmod +x /bin/start.sh
+    chmod +x /bin/entrypoint.sh
     php /tmp/composer-installer --install-dir=/usr/local/bin --filename=composer
 EOF
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/bin/start.sh"]
+CMD ["/bin/entrypoint.sh"]

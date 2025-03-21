@@ -65,6 +65,7 @@ COPY docker/entrypoint.sh /bin/entrypoint.sh
 ADD https://getcomposer.org/installer /tmp/composer-installer
 # Set up composer
 RUN <<EOF
+    mkdir /etc/apache2/conf.d
     chmod +x /bin/entrypoint.sh
     php /tmp/composer-installer --install-dir=/usr/local/bin --filename=composer
 EOF

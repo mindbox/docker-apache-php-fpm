@@ -69,6 +69,7 @@ The Apache configuration is located in `docker/apache2.conf`. Key settings inclu
 - Performance tuning for static content
 - MPM-Event optimization for containers
 - PHP-FPM integration via Unix socket
+- **Custom Configuration Files**: You can include additional custom configuration files by placing them in the `conf-enabled` or `conf.d` directories. These files will be included automatically.
 
 ## Contributing
 

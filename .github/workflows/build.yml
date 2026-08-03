@@ -76,26 +76,31 @@ jobs:
       # A tag that does not exist fails at "Set up job", after the matrix has
       # already fanned out — eight jobs burned before anything is built. Checking
       # the refs up front costs a few seconds and catches it here instead.
+      #
+      # Uses git ls-remote rather than the REST API on purpose: GITHUB_TOKEN is
+      # scoped to this repository and cannot read refs from the action repos, so
+      # an API-based check reports every external action as missing. ls-remote
+      # needs no authentication at all for public repositories.
       - name: Verify all referenced action versions exist
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          mapfile -t refs < <(
+            grep -rhoE "uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+" .github/workflows/ \
+              | sed 's/uses: //' | sort -u
+          )
           missing=0
-          grep -rhoE "uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+" .github/workflows/ \
-            | sed 's/uses: //' | sort -u | while read -r ref; do
-              repo="${ref%@*}"; tag="${ref#*@}"
-              if gh api "repos/${repo}/git/ref/tags/${tag}" --jq '.ref' > /dev/null 2>&1; then
-                echo "ok      ${ref}"
-              else
-                echo "MISSING ${ref}"
-                missing=1
-              fi
-              # `missing` is set inside a pipeline subshell, so the marker file is
-              # what actually survives to the check below.
-              [ "${missing}" = "0" ] || touch /tmp/missing-action
-            done
-          if [ -e /tmp/missing-action ]; then
+          for ref in "${refs[@]}"; do
+            repo="${ref%@*}"
+            tag="${ref#*@}"
+            if git ls-remote --exit-code --tags \
+                 "https://github.com/${repo}.git" "refs/tags/${tag}" > /dev/null 2>&1; then
+              echo "ok      ${ref}"
+            else
+              echo "MISSING ${ref}"
+              missing=1
+            fi
+          done
+          if [ "${missing}" != "0" ]; then
             echo "One or more referenced actions do not exist." >&2
             exit 1
           fi

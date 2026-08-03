@@ -128,7 +128,7 @@ jobs:
 
       # --- Stage 1: build for this architecture and test it ------------------
       - name: Build image for testing
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./docker/Dockerfile
@@ -181,7 +181,7 @@ jobs:
       - name: Push by digest
         id: push
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./docker/Dockerfile

@@ -324,10 +324,19 @@ jobs:
 
           # A tag that silently lost an architecture is worse than a failed
           # build, because consumers only find out at pull time.
+          #
+          # Matched with jq rather than grep: the raw manifest is pretty-printed,
+          # so "architecture": "amd64" carries a space that a naive grep pattern
+          # misses. The index also contains unknown/unknown entries for the
+          # provenance and SBOM attestations, so the os must be checked too.
+          raw="$(docker buildx imagetools inspect "${ref}" --raw)"
           for arch in amd64 arm64; do
-            docker buildx imagetools inspect "${ref}" --raw \
-              | grep -q "\"architecture\":\"${arch}\"" \
+            printf '%s' "${raw}" \
+              | jq -e --arg a "${arch}" \
+                  'any(.manifests[]; .platform.os == "linux" and .platform.architecture == $a)' \
+                  > /dev/null \
               || { echo "Published manifest is missing linux/${arch}" >&2; exit 1; }
+            echo "ok: linux/${arch} present"
           done
 
           {

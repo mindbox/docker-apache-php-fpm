@@ -47,7 +47,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned rather than `apt-get install shellcheck`: the Ubuntu archive
       # version drifts from whatever developers run locally, and the two disagree
@@ -66,12 +66,39 @@ jobs:
           shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh
 
       - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@v3.4.0
         with:
           dockerfile: docker/Dockerfile
           # DL3008: we deliberately do not pin apt versions — the daily rebuild
           # exists precisely to pick up patched packages.
           ignore: DL3008,DL3059
+
+      # A tag that does not exist fails at "Set up job", after the matrix has
+      # already fanned out — eight jobs burned before anything is built. Checking
+      # the refs up front costs a few seconds and catches it here instead.
+      - name: Verify all referenced action versions exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          grep -rhoE "uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+" .github/workflows/ \
+            | sed 's/uses: //' | sort -u | while read -r ref; do
+              repo="${ref%@*}"; tag="${ref#*@}"
+              if gh api "repos/${repo}/git/ref/tags/${tag}" --jq '.ref' > /dev/null 2>&1; then
+                echo "ok      ${ref}"
+              else
+                echo "MISSING ${ref}"
+                missing=1
+              fi
+              # `missing` is set inside a pipeline subshell, so the marker file is
+              # what actually survives to the check below.
+              [ "${missing}" = "0" ] || touch /tmp/missing-action
+            done
+          if [ -e /tmp/missing-action ]; then
+            echo "One or more referenced actions do not exist." >&2
+            exit 1
+          fi
 
   # One job per architecture on a native runner, rather than one job building
   # both through QEMU.
@@ -109,11 +136,11 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # No QEMU: each runner builds for its own architecture.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # A daily rebuild alone does NOT pick up OS security updates. BuildKit
       # keys the install layer on the instruction text plus the parent layer, so
@@ -139,7 +166,7 @@ jobs:
 
       # --- Stage 1: build for this architecture and test it ------------------
       - name: Build image for testing
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./docker/Dockerfile
@@ -169,7 +196,7 @@ jobs:
 
       # --- Stage 2: scan -----------------------------------------------------
       - name: Scan for vulnerabilities
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: php-fpm-apache:test
           format: table
@@ -183,7 +210,7 @@ jobs:
       # --- Stage 3: push this architecture by digest -------------------------
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -192,7 +219,7 @@ jobs:
       - name: Push by digest
         id: push
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./docker/Dockerfile
@@ -217,7 +244,7 @@ jobs:
 
       - name: Upload digest
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digest-${{ matrix.php_version }}-${{ matrix.platform.arch }}
           path: /tmp/digests/*
@@ -238,17 +265,17 @@ jobs:
         php_version: ['8.2', '8.3', '8.4', '8.5']
     steps:
       - name: Download digests for this version
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digest-${{ matrix.php_version }}-*
           merge-multiple: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

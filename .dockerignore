@@ -1,0 +1,6 @@
+*
+!docker/
+
+# Everything is excluded by default and re-included above, so the build context
+# stays at a few kilobytes. Without this, .git/ and the docs are shipped into
+# the build context on every layer invalidation.

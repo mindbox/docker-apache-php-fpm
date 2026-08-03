@@ -1,0 +1,14 @@
+# Locales generated into the image (TYPO3 relies on setlocale() for date and
+# number formatting in the frontend).
+#
+# NOTE: these must be valid glibc locale names from /usr/share/i18n/locales.
+# The previous list contained "ar_AR" and "vi_VI", neither of which exists —
+# locale-gen silently skips unknown names.
+de_DE.UTF-8 UTF-8
+en_US.UTF-8 UTF-8
+en_GB.UTF-8 UTF-8
+ru_RU.UTF-8 UTF-8
+fr_FR.UTF-8 UTF-8
+ar_AE.UTF-8 UTF-8
+vi_VN.UTF-8 UTF-8
+fa_IR.UTF-8 UTF-8

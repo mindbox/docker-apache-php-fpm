@@ -53,7 +53,10 @@ assert_not_contains() {
     esac
 }
 
-# shellcheck disable=SC2329  # invoked indirectly via trap
+# Invoked indirectly via trap, which shellcheck cannot see. Both codes are listed
+# because which one fires depends on the shellcheck version: SC2317 in 0.9.x,
+# SC2329 in 0.11.x.
+# shellcheck disable=SC2329,SC2317
 cleanup() {
     docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
     rm -rf "${WORKDIR}"

@@ -330,18 +330,27 @@ apache_pid=""
 shutting_down=0
 
 shutdown() {
-    [ "${shutting_down}" = "1" ] && return
+    if [ "${shutting_down}" = "1" ]; then
+        return 0
+    fi
     shutting_down=1
     log "shutting down"
 
     # Apache: SIGWINCH is graceful-stop — stop accepting, finish in-flight.
-    [ -n "${apache_pid}" ] && kill -WINCH "${apache_pid}" 2>/dev/null || true
+    if [ -n "${apache_pid}" ]; then
+        kill -WINCH "${apache_pid}" 2>/dev/null || true
+    fi
     # PHP-FPM: SIGQUIT is the graceful shutdown signal.
-    [ -n "${fpm_pid}" ] && kill -QUIT "${fpm_pid}" 2>/dev/null || true
+    if [ -n "${fpm_pid}" ]; then
+        kill -QUIT "${fpm_pid}" 2>/dev/null || true
+    fi
 
+    # Keep waiting while either process is still alive.
     local waited=0
     while [ "${waited}" -lt 25 ]; do
-        kill -0 "${apache_pid}" 2>/dev/null || kill -0 "${fpm_pid}" 2>/dev/null || return 0
+        if ! kill -0 "${apache_pid}" 2>/dev/null && ! kill -0 "${fpm_pid}" 2>/dev/null; then
+            return 0
+        fi
         sleep 1
         waited=$(( waited + 1 ))
     done

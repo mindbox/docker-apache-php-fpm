@@ -47,7 +47,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned rather than `apt-get install shellcheck`: the Ubuntu archive
       # version drifts from whatever developers run locally, and the two disagree
@@ -109,7 +109,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # No QEMU: each runner builds for its own architecture.
       - name: Set up Docker Buildx

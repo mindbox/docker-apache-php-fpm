@@ -1,23 +1,237 @@
-name: Daily Build PHP-Apache Images
+name: Build PHP-Apache Images
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Täglicher Build
-  workflow_dispatch:  # Manuelles Triggern
+    # Daily: picks up new php:*-fpm base images (new PHP patch releases, and the
+    # Debian security updates the official images bake in).
+    #
+    # On Sundays the build additionally runs WITHOUT the layer cache — see the
+    # "Decide cache strategy" step for why that is necessary rather than
+    # wasteful.
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: 'Rebuild from scratch, ignoring the layer cache'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - 'test/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'docker/**'
+      - 'test/**'
+      - '.github/workflows/build.yml'
+
+# The default token is read-only for contents; pushing to GHCR needs packages.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/php-fpm-apache
+  # Which PHP version gets the :latest tag. TYPO3 13 and WordPress both support
+  # 8.4; 8.5 is built but not made the default yet.
+  LATEST_PHP: '8.4'
 
 jobs:
-  build:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint shell scripts
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck docker/entrypoint.sh docker/healthcheck.sh test/smoke-test.sh
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/Dockerfile
+          # DL3008: we deliberately do not pin apt versions — the daily rebuild
+          # exists precisely to pick up patched packages.
+          ignore: DL3008,DL3059
+
+  # One job per architecture on a native runner, rather than one job building
+  # both through QEMU.
+  #
+  # Emulating arm64 to compile this many PHP extensions is slow enough to
+  # dominate the whole pipeline, and it meant arm64 was only ever *built* — never
+  # tested, because a multi-platform image cannot be loaded into the local Docker
+  # daemon. Native runners remove the emulation entirely and let the smoke tests
+  # run on both architectures.
+  #
+  # Each job pushes an untagged, digest-addressed image; the merge job below
+  # combines them into one multi-arch manifest per tag.
+  build:
+    name: PHP ${{ matrix.php_version }} (${{ matrix.platform.arch }})
+    needs: lint
+    runs-on: ${{ matrix.platform.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        php_version: [8.0, 8.1, 8.2, 8.3, 8.4]
+        # 8.0 and 8.1 were dropped: both are end-of-life, so their base images
+        # no longer receive security patches. Existing tags stay in the registry
+        # but are no longer rebuilt. Keep this list in sync with the version loop
+        # in security-scan.yml.
+        php_version: ['8.2', '8.3', '8.4', '8.5']
+        platform:
+          - arch: amd64
+            runner: ubuntu-latest
+          # GitHub-hosted arm64 runners are free for public repositories. On a
+          # private repository they require a Team or Enterprise plan — if this
+          # label ever stops resolving, the jobs queue indefinitely rather than
+          # failing loudly. Falling back means restoring docker/setup-qemu-action
+          # and building both platforms in one job.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      # No QEMU: each runner builds for its own architecture.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # A daily rebuild alone does NOT pick up OS security updates. BuildKit
+      # keys the install layer on the instruction text plus the parent layer, so
+      # with a warm cache the whole apt-get step is a cache hit and never runs.
+      # Debian patches for the packages *we* install (apache2, imagemagick,
+      # ghostscript, libicu, ...) therefore only arrive when the php:*-fpm digest
+      # changes and invalidates the cache.
+      #
+      # That covers most cases — the official images are rebuilt for Debian
+      # security updates — but not all, and not promptly. So once a week the
+      # cache is bypassed entirely and every package is reinstalled at its
+      # current version.
+      - name: Decide cache strategy
+        id: cache
+        run: |
+          if [ "${{ inputs.no_cache }}" = "true" ] || [ "$(date -u +%u)" = "7" ]; then
+            echo "no_cache=true" >> "$GITHUB_OUTPUT"
+            echo "Building without cache: all OS packages will be reinstalled." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no_cache=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- Stage 1: build for this architecture and test it ------------------
+      - name: Build image for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/${{ matrix.platform.arch }}
+          load: true
+          tags: php-fpm-apache:test
+          build-args: |
+            PHP_VERSION=${{ matrix.php_version }}
+          # Always re-resolve php:<version>-fpm instead of reusing a locally
+          # known digest — without this the point of the nightly build is lost.
+          pull: true
+          no-cache: ${{ steps.cache.outputs.no_cache == 'true' }}
+          # Cache scoped per PHP version *and* architecture. Sharing a scope
+          # would have the matrix jobs overwrite each other's cache.
+          cache-from: type=gha,scope=php-${{ matrix.php_version }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,scope=php-${{ matrix.php_version }}-${{ matrix.platform.arch }},mode=max
+
+      - name: Run smoke tests
+        run: test/smoke-test.sh php-fpm-apache:test
+
+      - name: Report image size
+        run: |
+          fs="$(docker run --rm --entrypoint sh php-fpm-apache:test \
+                -c 'du -sm / 2>/dev/null | tail -1 | cut -f1')"
+          echo "- PHP ${{ matrix.php_version }} ${{ matrix.platform.arch }}: ${fs} MB filesystem" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # --- Stage 2: scan -----------------------------------------------------
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: php-fpm-apache:test
+          format: table
+          # Only fail on criticals that actually have a fix available —
+          # otherwise an unfixed upstream CVE blocks every build indefinitely.
+          # Measured on 8.4: 126 HIGH/CRITICAL findings exist, 0 are fixable.
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      # --- Stage 3: push this architecture by digest -------------------------
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push by digest
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/${{ matrix.platform.arch }}
+          build-args: |
+            PHP_VERSION=${{ matrix.php_version }}
+          # No tags here: the image is addressed by digest and only becomes
+          # reachable once the merge job assembles the manifest list.
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # Deliberately no `no-cache` — this reuses what the test build above
+          # just wrote, so a cache-bypassing run still only compiles once.
+          cache-from: type=gha,scope=php-${{ matrix.php_version }}-${{ matrix.platform.arch }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.php_version }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Combines the per-architecture digests into one multi-arch manifest per tag.
+  # Tags are only created here, so a tag never points at a half-built set of
+  # architectures.
+  merge:
+    name: Publish PHP ${{ matrix.php_version }}
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php_version: ['8.2', '8.3', '8.4', '8.5']
+    steps:
+      - name: Download digests for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.php_version }}-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -29,23 +243,91 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache Docker layers
-        uses: actions/cache@v3
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
 
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/php-fpm-apache:${{ matrix.php_version }}
-          build-args: |
-            PHP_VERSION=${{ matrix.php_version }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
+          date_tag="$(date -u +%Y%m%d)"
+          tags=(
+            "${IMAGE_NAME}:${{ matrix.php_version }}"
+            # Immutable tags so a broken daily build can be rolled back to. The
+            # rolling :<version> tag alone left no previous image to return to.
+            "${IMAGE_NAME}:${{ matrix.php_version }}-${date_tag}"
+            "${IMAGE_NAME}:${{ matrix.php_version }}-${GITHUB_SHA::7}"
+          )
+          if [ "${{ matrix.php_version }}" = "${LATEST_PHP}" ]; then
+            tags+=("${IMAGE_NAME}:latest")
+          fi
+
+          tag_args=()
+          for tag in "${tags[@]}"; do tag_args+=(-t "${tag}"); done
+
+          source_args=()
+          for digest in *; do source_args+=("${IMAGE_NAME}@sha256:${digest}"); done
+
+          if [ "${#source_args[@]}" -lt 2 ]; then
+            echo "Expected one digest per architecture, got ${#source_args[@]}." >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create "${tag_args[@]}" "${source_args[@]}"
+
+      - name: Verify the published manifest
+        run: |
+          set -euo pipefail
+          ref="${IMAGE_NAME}:${{ matrix.php_version }}"
+          docker buildx imagetools inspect "${ref}"
+
+          # A tag that silently lost an architecture is worse than a failed
+          # build, because consumers only find out at pull time.
+          for arch in amd64 arm64; do
+            docker buildx imagetools inspect "${ref}" --raw \
+              | grep -q "\"architecture\":\"${arch}\"" \
+              || { echo "Published manifest is missing linux/${arch}" >&2; exit 1; }
+          done
+
+          {
+            echo "### PHP ${{ matrix.php_version }} published"
+            echo "- \`${ref}\` (linux/amd64, linux/arm64)"
+            base="$(docker buildx imagetools inspect "php:${{ matrix.php_version }}-fpm" \
+                    --format '{{.Manifest.Digest}}' 2>/dev/null || echo unknown)"
+            echo "- built from \`php:${{ matrix.php_version }}-fpm@${base}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # A scheduled build that fails silently is worse than no scheduled build. This
+  # raises a GitHub issue so the failure is visible without anyone watching the
+  # Actions tab. Only for automated runs — a failing PR is already visible.
+  notify-failure:
+    name: Report nightly failure
+    needs: [lint, build, merge]
+    if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update an issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly image build is failing"
+          gh label create build-failure --color B60205 \
+            --description "Automated build or test failure" 2>/dev/null || true
+
+          body="The scheduled build failed.
+
+          Run: ${RUN_URL}
+
+          Until this is fixed the published tags are **stale** — they still point
+          at the last successful build, so nothing is broken for consumers, but
+          security updates are no longer arriving."
+
+          existing="$(gh issue list --state open --search "in:title \"${title}\"" \
+                       --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body "${body}"
+          else
+            gh issue create --title "${title}" --label build-failure --body "${body}"
+          fi

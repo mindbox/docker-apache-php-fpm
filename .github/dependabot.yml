@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  # The workflows pin every action to a major version. Those pins go stale
+  # silently — a deprecated action keeps working until the day it does not.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: 'ci'
+    labels:
+      - dependencies
+
+# Deliberately not covered here:
+#
+#   * The base image. `FROM php:${PHP_VERSION}-fpm` uses a build argument, which
+#     Dependabot cannot resolve, and the tag is meant to float so the nightly
+#     build picks up new patch releases on its own.
+#
+#   * The PECL extension pins (imagick, apcu, redis, igbinary). Dependabot has no
+#     PECL ecosystem. They are checked by .github/workflows/pin-drift.yml instead.

@@ -1,0 +1,151 @@
+name: Scan published images
+
+# The build-time Trivy scan can only catch vulnerabilities that were already
+# known when the image was built. Most CVEs are disclosed *after* the fact, so
+# an image that passed its scan last night can be vulnerable this morning with
+# nothing in the repository having changed.
+#
+# This workflow scans what is actually in the registry and raises a GitHub issue
+# when a fixable HIGH or CRITICAL finding appears. It answers "is what we are
+# shipping right now vulnerable", which no rebuild schedule can answer on its own.
+
+on:
+  schedule:
+    # 06:00 UTC — after the 00:00 build, so it scans the freshest tags.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+  issues: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/php-fpm-apache
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] \
+            https://aquasecurity.github.io/trivy-repo/deb generic main" \
+            | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      # Kept in sync with matrix.php_version in build.yml by hand — there are
+      # only ever a handful of supported versions, and wiring a shared matrix
+      # between workflows costs more than it saves.
+      - name: Scan every published tag
+        id: scan
+        run: |
+          set -uo pipefail
+          : > report.md
+          findings=0
+
+          for version in 8.2 8.3 8.4 8.5; do
+            ref="${IMAGE_NAME}:${version}"
+            echo "::group::Scanning ${ref}"
+
+            # --ignore-unfixed: an upstream CVE with no available patch is not
+            # actionable here and would make this alert permanently noisy.
+            if ! trivy image --quiet --scanners vuln \
+                 --severity HIGH,CRITICAL --ignore-unfixed \
+                 --format json --output "scan-${version}.json" "${ref}"; then
+              echo "Trivy could not scan ${ref} (tag missing?)" >> report.md
+              echo "::endgroup::"
+              continue
+            fi
+
+            count="$(jq '[.Results[]?.Vulnerabilities // [] | length] | add // 0' \
+                     "scan-${version}.json")"
+            echo "${ref}: ${count} fixable HIGH/CRITICAL"
+
+            if [ "${count}" -gt 0 ]; then
+              findings=$(( findings + count ))
+              {
+                echo "### \`${ref}\` — ${count} fixable HIGH/CRITICAL"
+                echo
+                echo "| CVE | Severity | Package | Installed | Fixed in |"
+                echo "|---|---|---|---|---|"
+                jq -r '.Results[]?.Vulnerabilities // [] | .[]
+                       | "| \(.VulnerabilityID) | \(.Severity) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion) |"' \
+                   "scan-${version}.json" | sort -u
+                echo
+              } >> report.md
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "findings=${findings}" >> "$GITHUB_OUTPUT"
+          cat report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Open or update an issue
+        if: steps.scan.outputs.findings != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Fixable vulnerabilities in published images"
+          gh label create security --color D93F0B \
+            --description "Vulnerability findings in published images" 2>/dev/null || true
+
+          {
+            echo "Trivy found **${{ steps.scan.outputs.findings }}** fixable"
+            echo "HIGH/CRITICAL vulnerabilities in the currently published tags."
+            echo
+            echo "Every finding has a fix available upstream, so the usual"
+            echo "remedy is to trigger a cache-bypassing rebuild:"
+            echo
+            echo '```'
+            echo "gh workflow run build.yml -f no_cache=true"
+            echo '```'
+            echo
+            echo "If the fix is not yet in the Debian archive, the rebuild will"
+            echo "not clear it and this issue should stay open until it is."
+            echo
+            echo "Scan run: ${RUN_URL}"
+            echo
+            cat report.md
+          } > issue.md
+
+          existing="$(gh issue list --state open --search "in:title \"${title}\"" \
+                       --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue.md
+          else
+            gh issue create --title "${title}" --label security --body-file issue.md
+          fi
+
+      - name: Close the issue when clean
+        if: steps.scan.outputs.findings == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="Fixable vulnerabilities in published images"
+          existing="$(gh issue list --state open --search "in:title \"${title}\"" \
+                       --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh issue close "${existing}" \
+              --comment "No fixable HIGH/CRITICAL findings remain in the published tags."
+          fi

@@ -1,0 +1,113 @@
+name: Check PECL pin drift
+
+# The PECL extension versions are pinned in docker/Dockerfile so that a new
+# upstream release cannot break or silently change the nightly build. The
+# trade-off is that the pins stop moving — including past security fixes in the
+# extensions themselves.
+#
+# Dependabot has no PECL ecosystem, so this compares each pin against the current
+# stable release and raises an issue when they diverge. It deliberately does not
+# open a PR: bumping a pin needs a build across the whole PHP matrix to verify,
+# which is what a human reviewing the issue will trigger.
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays, after the weekly no-cache rebuild
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: Compare pins against PECL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare
+        id: compare
+        run: |
+          set -uo pipefail
+          : > drift.md
+          drift=0
+
+          for ext in imagick apcu redis igbinary; do
+            arg="$(printf '%s' "${ext}" | tr '[:lower:]' '[:upper:]')_VERSION"
+            pinned="$(grep -oP "^ARG ${arg}=\K.*" docker/Dockerfile || true)"
+            if [ -z "${pinned}" ]; then
+              echo "Could not read ARG ${arg} from docker/Dockerfile" >> drift.md
+              drift=$(( drift + 1 ))
+              continue
+            fi
+
+            latest="$(curl -fsS --max-time 20 \
+                      "https://pecl.php.net/rest/r/${ext}/stable.txt" || echo '')"
+            if [ -z "${latest}" ]; then
+              echo "- \`${ext}\`: could not reach PECL (pinned \`${pinned}\`)" >> drift.md
+              continue
+            fi
+
+            if [ "${pinned}" = "${latest}" ]; then
+              echo "${ext}: up to date (${pinned})"
+              continue
+            fi
+
+            drift=$(( drift + 1 ))
+            case "${pinned}" in
+              *RC*|*beta*|*alpha*)
+                # igbinary is intentionally pinned to a release candidate because
+                # the last stable does not compile on PHP 8.5. A stable release
+                # appearing is precisely the signal to move off the RC.
+                echo "- \`${ext}\`: pinned to pre-release \`${pinned}\`, PECL now lists \`${latest}\` — check whether the RC pin can be dropped" >> drift.md
+                ;;
+              *)
+                echo "- \`${ext}\`: pinned \`${pinned}\`, current stable \`${latest}\`" >> drift.md
+                ;;
+            esac
+          done
+
+          echo "drift=${drift}" >> "$GITHUB_OUTPUT"
+          cat drift.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Open or update an issue
+        if: steps.compare.outputs.drift != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="PECL extension pins are behind upstream"
+          gh label create dependencies --color 0366D6 \
+            --description "Dependency and pin updates" 2>/dev/null || true
+
+          {
+            echo "The pinned PECL versions in \`docker/Dockerfile\` differ from"
+            echo "the current stable releases:"
+            echo
+            cat drift.md
+            echo
+            echo "To adopt a new version, edit the \`ARG\` in \`docker/Dockerfile\`"
+            echo "and let CI build and smoke-test the full matrix. Verify PHP 8.5"
+            echo "specifically — it is the version most likely to reject an older"
+            echo "extension release."
+          } > issue.md
+
+          existing="$(gh issue list --state open --search "in:title \"${title}\"" \
+                       --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh issue comment "${existing}" --body-file issue.md
+          else
+            gh issue create --title "${title}" --label dependencies --body-file issue.md
+          fi
+
+      - name: Close the issue when all pins are current
+        if: steps.compare.outputs.drift == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="PECL extension pins are behind upstream"
+          existing="$(gh issue list --state open --search "in:title \"${title}\"" \
+                       --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh issue close "${existing}" --comment "All PECL pins match the current stable releases."
+          fi
